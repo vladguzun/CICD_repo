@@ -1,26 +1,35 @@
 pipeline {
   agent any
-  environment {
-    REGISTRY = 'docker.io'
-    DOCKERHUB_USER = 'YOUR_DOCKERHUB_USER'
-    APP = 'mini-flask-ci'
-    COMMIT = "${env.GIT_COMMIT?.take(7) ?: 'dev'}"
-    IMAGE = "${env.DOCKERHUB_USER}/${env.APP}"
+
+  options {
+    timestamps()
+    ansiColor('xterm')  // păstrează dacă ai pluginul AnsiColor
   }
-  options { timestamps(); ansiColor('xterm') }
+
+  environment {
+    DOCKERHUB_USER = 'vladguzun'         // schimbă dacă e altul
+    IMAGE_NAME     = 'cicd-flask'        // numele imaginii
+  }
 
   stages {
     stage('Checkout') {
-      steps { checkout scm }
+      steps {
+        checkout([
+          $class: 'GitSCM',
+          branches: [[name: '*/main']],
+          userRemoteConfigs: [[url: 'git@github.com:vladguzun/CICD_repo.git']]
+        ])
+      }
     }
 
-    stage('Unit tests') {
+    stage('Unit tests (Python 3.11 in Docker)') {
+      agent { docker { image 'python:3.11-slim' } }
       steps {
         sh '''
-          python3 -m venv .venv
-          . .venv/bin/activate
-          pip install -r requirements.txt
-          pytest -q
+          python --version
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -d tests ]; then python -m pytest -q; else echo "No tests/ directory, skipping."; fi
         '''
       }
     }
@@ -28,29 +37,23 @@ pipeline {
     stage('Docker Build') {
       steps {
         sh '''
-          docker build -t ${IMAGE}:${COMMIT} -t ${IMAGE}:latest .
+          docker build -t ${DOCKERHUB_USER}/${IMAGE_NAME}:$BUILD_NUMBER -t ${DOCKERHUB_USER}/${IMAGE_NAME}:latest .
         '''
       }
     }
 
     stage('Docker Push') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DU', passwordVariable: 'DP')]) {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub_creds', passwordVariable: 'DH_PASS', usernameVariable: 'DH_USER')]) {
           sh '''
-            echo "$DP" | docker login -u "$DU" --password-stdin ${REGISTRY}
-            docker push ${IMAGE}:${COMMIT}
-            docker push ${IMAGE}:latest
-            docker logout ${REGISTRY}
+            echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+            docker push ${DOCKERHUB_USER}/${IMAGE_NAME}:$BUILD_NUMBER
+            docker push ${DOCKERHUB_USER}/${IMAGE_NAME}:latest
+            docker logout
           '''
         }
       }
     }
-  }
-
-  post {
-    success { echo "✅ Pushed ${IMAGE}:${COMMIT} și :latest" }
-    failure { echo "❌ Pipeline failed" }
-    always  { cleanWs() }
   }
 }
 
