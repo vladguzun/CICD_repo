@@ -7,7 +7,7 @@ pipeline {
   }
 
   environment {
-    DOCKERHUB_USER = 'vladguzun'         // schimbă dacă e altul
+    DOCKERHUB_USER = 'vladdockerr'         // schimbă dacă e altul
     IMAGE_NAME     = 'cicd-flask'        // numele imaginii
   }
 
