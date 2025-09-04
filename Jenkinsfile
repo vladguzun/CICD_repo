@@ -1,21 +1,25 @@
 pipeline {
   agent any
-  options { timestamps(); ansiColor('xterm') }  // keep if AnsiColor plugin installed
+  options { timestamps(); ansiColor('xterm') } // cere pluginul AnsiColor (altfel scoate linia)
+
+  environment {
+    IMAGE_NAME   = 'vladdocker/cicd-flask' // schimbă dacă vrei alt nume
+  }
 
   stages {
-    // Multibranch/Pipeline-from-SCM already does checkout before this pipeline runs.
+    // Checkout e făcut de "Pipeline script from SCM" / Multibranch automat.
 
     stage('Unit tests') {
-      agent { docker { image 'python:3.11-slim' } }   // clean Python env
+      agent { docker { image 'python:3.11-slim' } }  // mediu curat de test
       steps {
         sh '''
           set -e
-          export PYTHONPATH="$PWD"     # make app.py importable in tests
+          export PYTHONPATH="$PWD"      # ca 'app.py' să fie importabil
           python --version
           pip install -U pip
           [ -f requirements.txt ] && pip install -r requirements.txt
           pip install pytest
-          [ -d tests ] && pytest -q || echo "No tests/, skipping."
+          pytest -q
         '''
       }
     }
@@ -25,26 +29,20 @@ pipeline {
       steps {
         sh '''
           set -e
-          docker build -t vladdocker/cicd-flask:${BUILD_NUMBER} \
-                       -t vladdocker/cicd-flask:latest .
+          docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} -t ${IMAGE_NAME}:latest .
         '''
       }
     }
 
-    stage('Smoke test') {
+    stage('Smoke test (port 8000)') {
       when { expression { fileExists('Dockerfile') } }
       steps {
         sh '''
           set -e
           docker rm -f cicd-flask-test 2>/dev/null || true
-          docker run -d --rm --name cicd-flask-test -p 5000:5000 vladdocker/cicd-flask:latest
+          docker run -d --rm --name cicd-flask-test -p 8000:8000 ${IMAGE_NAME}:latest
           for i in $(seq 1 20); do
-            if command -v curl >/dev/null; then
-              curl -fsS http://localhost:5000/health && ok=1 && break || true
-            else
-              wget -qO- http://localhost:5000/health >/dev/null && ok=1 && break || true
-            fi
-            sleep 1
+            curl -fsS http://localhost:8000/health && ok=1 && break || sleep 1
           done
           [ "${ok:-0}" = "1" ] || (echo "Healthcheck failed"; docker logs cicd-flask-test; exit 1)
           docker rm -f cicd-flask-test
@@ -55,12 +53,12 @@ pipeline {
     stage('Docker push') {
       when { expression { fileExists('Dockerfile') } }
       steps {
-        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
           sh '''
             set -e
-            echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
-            docker push vladdocker/cicd-flask:${BUILD_NUMBER}
-            docker push vladdocker/cicd-flask:latest
+            echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+            docker push ${IMAGE_NAME}:${BUILD_NUMBER}
+            docker push ${IMAGE_NAME}:latest
             docker logout
           '''
         }
