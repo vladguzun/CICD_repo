@@ -1,10 +1,6 @@
 pipeline {
   agent any
-
-  options {
-    ansiColor('xterm')
-    timestamps()
-  }
+  options { ansiColor('xterm'); timestamps() }
 
   environment {
     IMAGE = 'vladdocker/cicd-flask'
@@ -50,43 +46,51 @@ pipeline {
         sh '''
           set -e
 
-          # ensure previous container is gone
+          # Helpful: see who is using 8000 in case of conflicts
+          echo "== Currently published ports =="
+          docker ps --format "{{.Names}} -> {{.Ports}}"
+
+          # Ensure previous test container is gone
           docker rm -f cicd-flask-test >/dev/null 2>&1 || true
 
-          # Map container 8000 to a RANDOM host port by leaving host port empty: -p :8000
-          docker run -d --rm --name cicd-flask-test -p :8000 "$IMAGE:latest"
+          # Map container 8000 to a RANDOM host port (portable syntax)
+          # The "0" means: pick any free host port.
+          docker run -d --rm --name cicd-flask-test -p 0.0.0.0:0:8000 "$IMAGE:latest"
 
           # Discover the random host port Docker picked
-          HOSTPORT=$(docker inspect -f '{{ (index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort }}' cicd-flask-test)
+          HOSTPORT="$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort}}' cicd-flask-test)"
+          if [ -z "$HOSTPORT" ]; then
+            # Fallback (older Docker): parse `docker port`
+            HOSTPORT="$(docker port cicd-flask-test 8000/tcp | awk -F: '{print $NF}')"
+          fi
           echo "Discovered host port: $HOSTPORT"
 
           # Wait up to ~30s for /health
           ok=0
           for i in $(seq 1 30); do
-            if command -v curl >/dev/null 2>&1; then
-              curl -fsS "http://localhost:${HOSTPORT}/health" && ok=1 && break || true
-            else
-              wget -qO- "http://localhost:${HOSTPORT}/health" && ok=1 && break || true
+            if curl -fsS "http://127.0.0.1:${HOSTPORT}/health" >/dev/null 2>&1; then
+              ok=1; break
             fi
             sleep 1
           done
 
           if [ "$ok" != "1" ]; then
-            echo "Healthcheck failed on port $HOSTPORT"
+            echo "Healthcheck FAILED on port $HOSTPORT"
+            echo "== Container logs =="
             docker logs cicd-flask-test || true
             exit 1
           fi
+
+          echo "Healthcheck OK on port $HOSTPORT"
         '''
       }
       post {
-        always {
-          sh 'docker rm -f cicd-flask-test >/dev/null 2>&1 || true'
-        }
+        always { sh 'docker rm -f cicd-flask-test >/dev/null 2>&1 || true' }
       }
     }
 
     stage('Docker push') {
-      when { expression { return true } } // toggle as you wish
+      when { expression { return true } } // set to false if you don't want to push
       steps {
         withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
           sh '''
@@ -101,8 +105,6 @@ pipeline {
   }
 
   post {
-    always {
-      echo "Build finished with status: ${currentBuild.currentResult}"
-    }
+    always { echo "Build finished with status: ${currentBuild.currentResult}" }
   }
 }
