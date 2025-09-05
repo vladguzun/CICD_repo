@@ -1,12 +1,10 @@
 pipeline {
   agent any
-  options {
-    timestamps()
-    ansiColor('xterm')
-  }
+  options { timestamps(); ansiColor('xterm') }
+
   environment {
-    IMAGE = 'vladdocker/cicd-flask'
-    TAG   = '2'
+    IMAGE = 'vladdocker/cicd-flask'   // <- your Docker Hub repo
+    TAG   = "${env.BUILD_NUMBER}"
   }
 
   stages {
@@ -15,25 +13,29 @@ pipeline {
     }
 
     stage('Unit tests (venv in python:3.11-slim)') {
-      agent {
-        docker {
-          image 'python:3.11-slim'
-          // run as jenkins user, set HOME to writable place, reuse workspace
-          args  '-u 1000:1000 -e HOME=/tmp'
-          reuseNode true
-        }
-      }
       steps {
-        sh '''
-          set -e
-          python -m venv .venv
-          . .venv/bin/activate
-          python --version
-          pip install -U pip
-          [ -f requirements.txt ] && pip install -r requirements.txt
-          pip install pytest
-          [ -d tests ] && pytest -q || echo "No tests/ directory, skipping"
-        '''
+        script {
+          // make sure the image is available
+          sh 'docker inspect -f . python:3.11-slim || docker pull python:3.11-slim'
+
+          // run tests in a disposable python container with a local venv
+          docker.image('python:3.11-slim').inside('-u 1000:1000 -e HOME=/tmp') {
+            sh '''
+              set -e
+              python -m venv .venv
+              . .venv/bin/activate
+              python --version
+              pip install -U pip
+              [ -f requirements.txt ] && pip install -r requirements.txt
+              pip install pytest
+              if [ -d tests ]; then
+                pytest -q
+              else
+                echo "No tests/ directory, skipping"
+              fi
+            '''
+          }
+        }
       }
     }
 
@@ -46,22 +48,25 @@ pipeline {
       }
     }
 
-    stage('Smoke test (random free port)') {
+    stage('Smoke test (container IP, no host publish)') {
       steps {
-        script {
-          // pick an unused high port to avoid conflicts
-          env.SMOKE_PORT = sh(script: 'shuf -i 20000-65000 -n1', returnStdout: true).trim()
-        }
         sh '''
-          set -e -x
-          docker rm -f cicd-flask-test >/dev/null 2>&1 || true
-          docker run -d --rm --name cicd-flask-test -p ${SMOKE_PORT}:8000 "$IMAGE:latest"
+          set -e
 
-          # wait up to ~25s for health endpoint
+          # Clean any previous test container
+          docker rm -f cicd-flask-test >/dev/null 2>&1 || true
+
+          # Start the app container WITHOUT -p; we’ll curl it via its bridge IP
+          docker run -d --rm --name cicd-flask-test "$IMAGE:latest"
+
+          # Get bridge IP of the test container
+          APP_IP="$(docker inspect -f '{{ .NetworkSettings.IPAddress }}' cicd-flask-test)"
+          echo "Container IP: ${APP_IP}"
+
           ok=
           for i in $(seq 1 25); do
-            if curl -fsS "http://localhost:${SMOKE_PORT}/health" >/dev/null; then
-              echo "Healthcheck OK on port ${SMOKE_PORT}"
+            if curl -fsS "http://${APP_IP}:8000/health" >/dev/null; then
+              echo "Healthcheck OK at http://${APP_IP}:8000/health"
               ok=1
               break
             fi
@@ -69,33 +74,41 @@ pipeline {
           done
 
           if [ -z "$ok" ]; then
-            echo "Healthcheck FAILED on port ${SMOKE_PORT}"
+            echo "Healthcheck FAILED"
+            echo "--- docker logs cicd-flask-test ---"
             docker logs cicd-flask-test || true
             exit 1
           fi
+
+          # Stop the test container (it was started with --rm)
+          docker rm -f cicd-flask-test >/dev/null 2>&1 || true
         '''
       }
     }
 
     stage('Docker push') {
-      when {
-        expression { return env.DH_USER?.trim() && env.DH_PASS?.trim() }
-      }
+      when { branch 'main' }
       steps {
-        sh '''
-          set -e
-          echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin docker.io
-          docker push "$IMAGE:$TAG"
-          docker push "$IMAGE:latest"
-        '''
+        withCredentials([usernamePassword(
+          credentialsId: 'dockerhub',        // <- your Jenkins creds ID
+          usernameVariable: 'DH_USER',
+          passwordVariable: 'DH_PASS'
+        )]) {
+          sh '''
+            set -e
+            echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+            docker push "$IMAGE:$TAG"
+            docker push "$IMAGE:latest"
+          '''
+        }
       }
     }
   }
 
   post {
     always {
-      sh 'docker rm -f cicd-flask-test >/dev/null 2>&1 || true'
       echo "Build finished with status: ${currentBuild.currentResult}"
     }
   }
 }
+
