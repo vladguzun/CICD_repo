@@ -41,47 +41,41 @@ pipeline {
       }
     }
 
-    stage('Smoke test (random host port)') {
+    stage('Smoke test (no host port)') {
       steps {
         sh '''
           set -e
 
-          # Helpful: see who is using 8000 in case of conflicts
-          echo "== Currently published ports =="
+          echo "== Existing containers =="
           docker ps --format "{{.Names}} -> {{.Ports}}"
 
           # Ensure previous test container is gone
           docker rm -f cicd-flask-test >/dev/null 2>&1 || true
 
-          # Map container 8000 to a RANDOM host port (portable syntax)
-          # The "0" means: pick any free host port.
-          docker run -d --rm --name cicd-flask-test -p 0.0.0.0:0:8000 "$IMAGE:latest"
+          # Run WITHOUT -p; we'll call it by its container IP
+          docker run -d --rm --name cicd-flask-test "$IMAGE:latest"
 
-          # Discover the random host port Docker picked
-          HOSTPORT="$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort}}' cicd-flask-test)"
-          if [ -z "$HOSTPORT" ]; then
-            # Fallback (older Docker): parse `docker port`
-            HOSTPORT="$(docker port cicd-flask-test 8000/tcp | awk -F: '{print $NF}')"
-          fi
-          echo "Discovered host port: $HOSTPORT"
+          # Get the container's bridge IP (172.17.x.x)
+          IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' cicd-flask-test)"
+          echo "Container IP: $IP"
 
           # Wait up to ~30s for /health
           ok=0
           for i in $(seq 1 30); do
-            if curl -fsS "http://127.0.0.1:${HOSTPORT}/health" >/dev/null 2>&1; then
+            if curl -fsS "http://$IP:8000/health" >/dev/null 2>&1; then
               ok=1; break
             fi
             sleep 1
           done
 
           if [ "$ok" != "1" ]; then
-            echo "Healthcheck FAILED on port $HOSTPORT"
+            echo "Healthcheck FAILED at http://$IP:8000/health"
             echo "== Container logs =="
             docker logs cicd-flask-test || true
             exit 1
           fi
 
-          echo "Healthcheck OK on port $HOSTPORT"
+          echo "Healthcheck OK at http://$IP:8000/health"
         '''
       }
       post {
@@ -90,7 +84,7 @@ pipeline {
     }
 
     stage('Docker push') {
-      when { expression { return true } } // set to false if you don't want to push
+      when { expression { return true } } // set false to skip push
       steps {
         withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
           sh '''
