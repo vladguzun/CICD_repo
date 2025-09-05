@@ -1,0 +1,108 @@
+pipeline {
+  agent any
+
+  options {
+    ansiColor('xterm')
+    timestamps()
+  }
+
+  environment {
+    IMAGE = 'vladdocker/cicd-flask'
+    TAG   = "${env.BUILD_NUMBER}"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('Unit tests (venv in python:3.11-slim)') {
+      steps {
+        script {
+          docker.image('python:3.11-slim').inside('-e HOME=/tmp') {
+            sh '''
+              set -e
+              export PYTHONPATH=$PWD
+              python -m venv .venv
+              . .venv/bin/activate
+              python --version
+              pip install -U pip
+              [ -f requirements.txt ] && pip install -r requirements.txt
+              pip install pytest
+              [ -d tests ] && pytest -q || echo "No tests/ directory, skipping"
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Docker build') {
+      steps {
+        sh '''
+          set -e
+          docker build -t "$IMAGE:$TAG" -t "$IMAGE:latest" .
+        '''
+      }
+    }
+
+    stage('Smoke test (random host port)') {
+      steps {
+        sh '''
+          set -e
+
+          # ensure previous container is gone
+          docker rm -f cicd-flask-test >/dev/null 2>&1 || true
+
+          # Map container 8000 to a RANDOM host port by leaving host port empty: -p :8000
+          docker run -d --rm --name cicd-flask-test -p :8000 "$IMAGE:latest"
+
+          # Discover the random host port Docker picked
+          HOSTPORT=$(docker inspect -f '{{ (index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort }}' cicd-flask-test)
+          echo "Discovered host port: $HOSTPORT"
+
+          # Wait up to ~30s for /health
+          ok=0
+          for i in $(seq 1 30); do
+            if command -v curl >/dev/null 2>&1; then
+              curl -fsS "http://localhost:${HOSTPORT}/health" && ok=1 && break || true
+            else
+              wget -qO- "http://localhost:${HOSTPORT}/health" && ok=1 && break || true
+            fi
+            sleep 1
+          done
+
+          if [ "$ok" != "1" ]; then
+            echo "Healthcheck failed on port $HOSTPORT"
+            docker logs cicd-flask-test || true
+            exit 1
+          fi
+        '''
+      }
+      post {
+        always {
+          sh 'docker rm -f cicd-flask-test >/dev/null 2>&1 || true'
+        }
+      }
+    }
+
+    stage('Docker push') {
+      when { expression { return true } } // toggle as you wish
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+          sh '''
+            set -e
+            echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+            docker push "$IMAGE:$TAG"
+            docker push "$IMAGE:latest"
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      echo "Build finished with status: ${currentBuild.currentResult}"
+    }
+  }
+}
