@@ -2,110 +2,77 @@ pipeline {
   agent any
 
   environment {
-    APP_PORT   = '8000'
-    IMAGE_NAME = 'vladdocker/cicd-flask'
-  }
-
-  options {
-    timestamps()
-    ansiColor('xterm')
+    IMAGE = "vladdockerr/cicd-flask"
+    TAG   = "${env.BUILD_NUMBER}"
   }
 
   stages {
+
     stage('Checkout') {
       steps {
         checkout scm
       }
     }
 
-    stage('Unit tests (venv)') {
+    stage('Unit tests (venv in python:3.11)') {
       steps {
-        script {
-          sh '''
-            set -e
-            python3 -V
-            python3 -m venv .venv
-            . .venv/bin/activate
-            python -V
-            pip install -U pip
-            [ -f requirements.txt ] && pip install -r requirements.txt
-            pip install pytest
-            export PYTHONPATH="$PWD"
-            [ -d tests ] && pytest -q
-          '''
-        }
+        sh '''
+          set -euxo pipefail
+          docker run --rm \
+            -u $(id -u):$(id -g) \
+            -v "$PWD:/src" -w /src \
+            -e HOME=/tmp \
+            python:3.11-slim bash -lc '
+              python -m venv .venv
+              . .venv/bin/activate
+              pip install -U pip
+              [ -f requirements.txt ] && pip install -r requirements.txt
+              pip install -q pytest
+              pytest -q
+            '
+        '''
       }
     }
 
     stage('Docker build') {
       steps {
-        script {
-          sh '''
-            set -e
-            TAG="$(echo ${GIT_COMMIT:-latest} | cut -c1-7)"
-            docker build -t ${IMAGE_NAME}:${TAG} -t ${IMAGE_NAME}:latest .
-            echo "${TAG}" > .imgtag
-          '''
-        }
+        sh '''
+          set -eux
+          docker build -t "$IMAGE:$TAG" -t "$IMAGE:latest" .
+        '''
       }
     }
 
     stage('Smoke test') {
       steps {
-        script {
-          sh '''
-            set -e
-            TAG=$(cat .imgtag || echo latest)
-
-            # pornesc containerul fara publish pe host (evit conflictele de port)
-            docker rm -f cicd-flask-test >/dev/null 2>&1 || true
-            docker run -d --rm --name cicd-flask-test ${IMAGE_NAME}:${TAG}
-
-            # iau IP-ul containerului pe bridge-ul docker0
-            APP_IP=$(docker inspect -f '{{ .NetworkSettings.IPAddress }}' cicd-flask-test)
-            echo "Container IP: ${APP_IP}"
-
-            # astept sa porneasca si verific /health
-            ok=""
-            for i in $(seq 1 25); do
-              if curl -fsS "http://${APP_IP}:${APP_PORT}/health" >/dev/null; then
-                echo "Smoke OK: http://${APP_IP}:${APP_PORT}/health"
-                ok=1; break
-              fi
-              sleep 1
-            done
-
-            if [ -z "$ok" ]; then
-              echo "Smoke FAILED"
-              echo "==== Container logs ===="
-              docker logs cicd-flask-test || true
-              exit 1
+        sh '''
+          set -eux
+          docker rm -f cicd-flask-test || true
+          PORT=$(shuf -i 20000-65000 -n 1)
+          docker run -d --rm --name cicd-flask-test -p ${PORT}:8000 "$IMAGE:latest"
+          # așteaptă până pornește aplicația
+          for i in $(seq 1 30); do
+            if curl -fsS "http://localhost:${PORT}/health" | grep -q '"ok": *true'; then
+              echo "Healthcheck OK on ${PORT}"
+              break
             fi
-          '''
-        }
-      }
-      post {
-        always {
-          sh 'docker rm -f cicd-flask-test >/dev/null 2>&1 || true'
-        }
+            sleep 1
+            [ $i -eq 30 ] && { echo "Healthcheck FAILED on ${PORT}"; docker logs cicd-flask-test; exit 1; }
+          done
+          docker rm -f cicd-flask-test
+        '''
       }
     }
 
     stage('Docker push') {
       steps {
-        script {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
           sh '''
-            set -e
-            TAG=$(cat .imgtag || echo latest)
+            set -eux
+            echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+            docker push "$IMAGE:$TAG"
+            docker push "$IMAGE:latest"
           '''
-          withCredentials([usernamePassword(credentialsId: 'dockerhub', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
-            sh '''
-              echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
-              docker push ${IMAGE_NAME}:${TAG}
-              docker push ${IMAGE_NAME}:latest
-              docker logout || true
-            '''
-          }
         }
       }
     }
@@ -113,6 +80,7 @@ pipeline {
 
   post {
     always {
+      sh 'docker rm -f cicd-flask-test || true'
       echo "Build finished with status: ${currentBuild.currentResult}"
     }
   }
